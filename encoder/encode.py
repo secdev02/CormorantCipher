@@ -9264,27 +9264,31 @@ def to_b32_labels(s):
 
 def encode_spans(text, bits, stealth):
     """
-    Encodes bits into character spans. Spaces are rendered plainly and do NOT
-    consume a bit position — the decoder reads only data-s/data-bit spans so
-    both must agree on which positions carry bits.
+    Encodes exactly len(bits) non-space characters. Characters beyond that
+    are rendered as plain spans with no encoding (data-s="0" / class="v0").
+    Spaces never consume a bit position.
     """
     out = []
     bp  = 0
     for ch in text:
         if ch == " ":
             out.append('<span class="sp"> </span>')
-            continue   # ← spaces do NOT advance bp
-        bit = bits[bp % len(bits)]
+            continue
         esc = html_module.escape(ch, quote=False)
-        if stealth:
-            out.append('<span data-s="{}">{}</span>'.format(bit, esc))
+        if bp < len(bits):
+            bit = bits[bp]
+            if stealth:
+                out.append('<span data-s="{}">{}</span>'.format(bit, esc))
+            else:
+                cls = "v1" if bit else "v0"
+                out.append('<span class="{}" data-bit="{}" data-pos="{}">{}</span>'.format(
+                    cls, bit, bp, esc))
         else:
-            cls = "v1" if bit else "v0"
-            out.append(
-                '<span class="{}" data-bit="{}" data-pos="{}">{}</span>'.format(
-                    cls, bit, bp, esc
-                )
-            )
+            # Beyond encoding capacity — plain span, no bit
+            if stealth:
+                out.append('<span data-s="0">{}</span>'.format(esc))
+            else:
+                out.append('<span class="v0">{}</span>'.format(esc))
         bp += 1
     return "".join(out)
 
@@ -9327,6 +9331,7 @@ def build_html(secret, token, stealth=False):
 
     if stealth:
         constants_js = ''  # SECRET_TEXT removed entirely in stealth
+        bitstrip_js  = ''
 
         # ── Obfuscate TOKEN_BASE and STEG_LABELS ──────────────────────────
         # TOKEN: split into 3 chunks, each reversed for storage.
@@ -9367,22 +9372,17 @@ def build_html(secret, token, stealth=False):
             "for(var j=0;j<32;j++){h=((h<<5)+h)^(j*7);h=h&0xFFFFFFFF;if(h>=0x80000000)h-=0x100000000;k.push(h>=0?h&0xff:(h+256)&0xff);}return k;}\n"
             "function _xl(e,k){return e.map(function(v,i){return String.fromCharCode(v^k[i%k.length]);}).join('');}"
         )
-        bitstrip_js  = ""
         decoder_js   = """
 function decode() {
-  var spans = Array.from(document.querySelectorAll('[data-s]'));
+  var allSpans = Array.from(document.querySelectorAll('[data-s]'));
+  var spans = allSpans.slice(0, _bc);
   if (!spans.length) {
     document.getElementById('decoded-out').textContent = '(no carrier spans found)';
     return;
   }
 
-  /* Primary: read data-s attributes — these ARE the encoding.
-     data-s="1" means ss17 is active on that span; the font renders
-     the .steg1 glyph variant (+5 font-units Y-shift in the binary).
-     data-s="0" means standard baseline glyph. */
   var bits = spans.map(function(s) { return parseInt(s.getAttribute('data-s'), 10); });
 
-  /* Decode bit stream -> ASCII, 8 bits per char, MSB-first */
   var out = '';
   for (var i = 0; i + 7 < bits.length; i += 8) {
     var code = 0;
@@ -9390,10 +9390,7 @@ function decode() {
     if (code >= 32 && code < 127) { out += String.fromCharCode(code); }
   }
 
-  /* Secondary: verify via Y-position measurement.
-     At the hero font size (~64px), the 5-unit shift = ~0.32px — reliably
-     above the sub-pixel noise floor. Disagreement signals a tampered file. */
-  var measured = [];
+  /* Verify via Y-position measurement */
   var byLine = {};
   spans.forEach(function(s, idx) {
     var top = s.getBoundingClientRect().top;
@@ -9416,11 +9413,7 @@ function decode() {
   }
 
   var el = document.getElementById('decoded-out');
-  if (out.length) {
-    el.textContent = out + (mOut === out ? '  \u2713 verified' : '');
-  } else {
-    el.textContent = '(decoding failed)';
-  }
+  el.textContent = out.length ? out + (mOut === out ? '  \u2713' : '') : '(decoding failed)';
 }"""
     else:
         constants_js  = "var SECRET_BITS = {};\nvar SECRET_TEXT = {};".format(bits_js, secret_js)
@@ -9447,7 +9440,7 @@ function decode() {
         decoder_js   = """
 function decode(){
   var spans=Array.from(document.querySelectorAll('[data-bit]'));
-  spans=spans.slice(0,SECRET_BITS.length);
+  spans=spans.slice(0,_bc);
   var bits=spans.map(function(s){return parseInt(s.dataset.bit,10);});
   var out='';
   for(var i=0;i+7<bits.length;i+=8){var c=0;for(var j=0;j<8;j++)c=(c<<1)|(bits[i+j]&1);if(c>=32&&c<127)out+=String.fromCharCode(c);}
@@ -9580,6 +9573,7 @@ footer {{ margin-top: 4rem; padding-top: 1.5rem; border-top: 1px solid var(--rul
 }})();
 
 {constants_js}
+var _bc={bit_count};
 {obfuscated_js}
 
 {bitstrip_js}
@@ -9609,6 +9603,7 @@ footer {{ margin-top: 4rem; padding-top: 1.5rem; border-top: 1px solid var(--rul
         hero_spans    = hero_spans,
         chunks_js     = chunks_js,
         constants_js  = constants_js,
+        bit_count     = len(bits),
         obfuscated_js = obfuscated_js,
         bitstrip_js   = bitstrip_js,
         decoder_js    = decoder_js,

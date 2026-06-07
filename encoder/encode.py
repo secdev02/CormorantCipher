@@ -9264,20 +9264,16 @@ def to_b32_labels(s):
 
 def encode_spans(text, bits, stealth):
     """
-    Normal mode:  <span class="v0|v1" data-bit="N" data-pos="N">ch</span>
-    Stealth mode: <span data-s="0|1">ch</span>
-      CSS [data-s="1"] { font-feature-settings: "ss17" 1 } activates the
-      GSUB SingleSubst: replaces the glyph with its .steg1 variant, which
-      has all contours shifted +5 font-units up (0.50% of 1000 UPM).
-      Visually identical. Recoverable only by measuring rendered Y-position.
+    Encodes bits into character spans. Spaces are rendered plainly and do NOT
+    consume a bit position — the decoder reads only data-s/data-bit spans so
+    both must agree on which positions carry bits.
     """
     out = []
     bp  = 0
     for ch in text:
         if ch == " ":
             out.append('<span class="sp"> </span>')
-            bp += 1
-            continue
+            continue   # ← spaces do NOT advance bp
         bit = bits[bp % len(bits)]
         esc = html_module.escape(ch, quote=False)
         if stealth:
@@ -9330,31 +9326,114 @@ def build_html(secret, token, stealth=False):
     )
 
     if stealth:
-        constants_js = 'var SECRET_TEXT = {};'.format(secret_js)
+        constants_js = ''  # SECRET_TEXT removed entirely in stealth
+
+        # ── Obfuscate TOKEN_BASE and STEG_LABELS ──────────────────────────
+        # TOKEN: split into 3 chunks, each reversed for storage.
+        # JS reassembles by reversing each chunk and concatenating.
+        n  = len(token)
+        i1 = n // 3
+        i2 = 2 * n // 3
+        tA, tB, tC = token[:i1], token[i1:i2], token[i2:]
+        rA, rB, rC = tA[::-1], tB[::-1], tC[::-1]
+
+        # STEG_LABELS: XOR each char of the b32 label against a djb2-derived key.
+        # Key algorithm must match the JS _xk function exactly.
+        def djb2_key(t, length=32):
+            h = 5381
+            for c in t:
+                h = ((h << 5) + h) ^ ord(c)
+                h &= 0xFFFFFFFF
+                if h >= 0x80000000: h -= 0x100000000
+            k = []
+            for j in range(length):
+                h = ((h << 5) + h) ^ (j * 7)
+                h &= 0xFFFFFFFF
+                if h >= 0x80000000: h -= 0x100000000
+                k.append(h & 0xFF if h >= 0 else (h + 256) & 0xFF)
+            return k
+
+        key_bytes = djb2_key(token)
+        enc_label = [ord(c) ^ key_bytes[i % len(key_bytes)]
+                     for i, c in enumerate(labels[0])]
+
+        obfuscated_js = (
+            "var _ta={};var _tb={};var _tc={};\n".format(
+                json.dumps(rA), json.dumps(rB), json.dumps(rC)
+            ) +
+            "var _sl=[{}];\n".format(",".join(str(v) for v in enc_label)) +
+            "function _xk(t){var h=5381,k=[];"
+            "for(var i=0;i<t.length;i++){h=((h<<5)+h)^t.charCodeAt(i);h=h&0xFFFFFFFF;if(h>=0x80000000)h-=0x100000000;}"
+            "for(var j=0;j<32;j++){h=((h<<5)+h)^(j*7);h=h&0xFFFFFFFF;if(h>=0x80000000)h-=0x100000000;k.push(h>=0?h&0xff:(h+256)&0xff);}return k;}\n"
+            "function _xl(e,k){return e.map(function(v,i){return String.fromCharCode(v^k[i%k.length]);}).join('');}"
+        )
         bitstrip_js  = ""
         decoder_js   = """
 function decode() {
   var spans = Array.from(document.querySelectorAll('[data-s]'));
-  if (!spans.length) { document.getElementById('decoded-out').textContent = '(no spans)'; return; }
-  var byLine = {};
-  spans.forEach(function(s) {
-    var top = s.getBoundingClientRect().top;
-    var lk  = Math.round(top / 4) * 4;
-    if (!byLine[lk]) byLine[lk] = [];
-    byLine[lk].push(top);
-  });
-  var bits = [];
-  Object.keys(byLine).sort(function(a,b){return+a-+b;}).forEach(function(lk) {
-    var tops = byLine[lk].slice().sort(function(a,b){return a-b;});
-    var base = tops[Math.floor(tops.length/2)];
-    byLine[lk].forEach(function(top) { bits.push((base-top)>0.04?1:0); });
-  });
+  if (!spans.length) {
+    document.getElementById('decoded-out').textContent = '(no carrier spans found)';
+    return;
+  }
+
+  /* Primary: read data-s attributes — these ARE the encoding.
+     data-s="1" means ss17 is active on that span; the font renders
+     the .steg1 glyph variant (+5 font-units Y-shift in the binary).
+     data-s="0" means standard baseline glyph. */
+  var bits = spans.map(function(s) { return parseInt(s.getAttribute('data-s'), 10); });
+
+  /* Decode bit stream -> ASCII, 8 bits per char, MSB-first */
   var out = '';
-  for (var i=0;i+7<bits.length;i+=8){var c=0;for(var j=0;j<8;j++)c=(c<<1)|(bits[i+j]&1);if(c>=32&&c<127)out+=String.fromCharCode(c);}
-  document.getElementById('decoded-out').textContent = out||'(ensure font loaded)';
+  for (var i = 0; i + 7 < bits.length; i += 8) {
+    var code = 0;
+    for (var j = 0; j < 8; j++) { code = (code << 1) | (bits[i + j] & 1); }
+    if (code >= 32 && code < 127) { out += String.fromCharCode(code); }
+  }
+
+  /* Secondary: verify via Y-position measurement.
+     At the hero font size (~64px), the 5-unit shift = ~0.32px — reliably
+     above the sub-pixel noise floor. Disagreement signals a tampered file. */
+  var measured = [];
+  var byLine = {};
+  spans.forEach(function(s, idx) {
+    var top = s.getBoundingClientRect().top;
+    var lk  = Math.round(top / 6) * 6;
+    if (!byLine[lk]) byLine[lk] = [];
+    byLine[lk].push({ top: top, idx: idx });
+  });
+  var mBits = new Array(spans.length).fill(0);
+  Object.keys(byLine).forEach(function(lk) {
+    var group = byLine[lk];
+    var tops  = group.map(function(e) { return e.top; }).sort(function(a,b){return a-b;});
+    var base  = tops[Math.floor(tops.length / 2)];
+    group.forEach(function(e) { mBits[e.idx] = (base - e.top) > 0.08 ? 1 : 0; });
+  });
+  var mOut = '';
+  for (var i = 0; i + 7 < mBits.length; i += 8) {
+    var code = 0;
+    for (var j = 0; j < 8; j++) { code = (code << 1) | (mBits[i + j] & 1); }
+    if (code >= 32 && code < 127) { mOut += String.fromCharCode(code); }
+  }
+
+  var el = document.getElementById('decoded-out');
+  if (out.length) {
+    el.textContent = out + (mOut === out ? '  \u2713 verified' : '');
+  } else {
+    el.textContent = '(decoding failed)';
+  }
 }"""
     else:
-        constants_js = "var SECRET_BITS = {};\nvar SECRET_TEXT = {};".format(bits_js, secret_js)
+        constants_js  = "var SECRET_BITS = {};\nvar SECRET_TEXT = {};".format(bits_js, secret_js)
+        obfuscated_js = (
+            "var _ta={};\nvar _tb={};\nvar _tc={};\n".format(
+                json.dumps(token[:len(token)//3][::-1]),
+                json.dumps(token[len(token)//3:2*len(token)//3][::-1]),
+                json.dumps(token[2*len(token)//3:][::-1])
+            ) +
+            "var _sl=[{}];\n".format(",".join(str(ord(c) ^ list(hashlib.sha256(token.encode()).digest())[i % 32] for i, c in enumerate(labels[0])))) +
+            "function _xk(t){var k=[],h=5381;for(var i=0;i<t.length;i++){h=((h<<5)+h)^t.charCodeAt(i);h=h&h;}for(var j=0;j<32;j++){h=((h<<5)+h)^(j*7);k.push(((h>>>0)&0xff));}return k;}\n"
+            "function _xl(e,k){return e.map(function(v,i){return String.fromCharCode(v^k[i%k.length]);}).join('');}"
+        )
         bitstrip_js  = """
 (function(){
   var strip = document.getElementById('bit-strip');
@@ -9471,6 +9550,7 @@ footer {{ margin-top: 4rem; padding-top: 1.5rem; border-top: 1px solid var(--rul
 <div class="decoder">
   <div class="dec-label">Decoded watermark</div>
   <div id="decoded-out">scanning…</div>
+  <button onclick="decode()" style="margin-top:0.6rem;font-family:monospace;font-size:0.6rem;letter-spacing:0.2em;text-transform:uppercase;background:var(--ink);color:var(--gold);border:none;padding:0.3rem 0.8rem;cursor:pointer;">Decode</button>
 </div>
 
 <footer>
@@ -9493,25 +9573,32 @@ footer {{ margin-top: 4rem; padding-top: 1.5rem; border-top: 1px solid var(--rul
   document.fonts.ready.then(function(){{
     var el=document.getElementById('font-status');
     if(el){{el.style.opacity='0';setTimeout(function(){{el.remove();}},400);}}
-    setTimeout(decode,300);
-    setTimeout(decode,900);
+    setTimeout(decode, 400);
+    setTimeout(decode, 1200);
+    setTimeout(decode, 2500);
   }});
 }})();
 
 {constants_js}
-var STEG_LABELS={labels_js};
-var TOKEN_BASE={token_js};
+{obfuscated_js}
 
 {bitstrip_js}
 {decoder_js}
 
 (function canary(){{
+  /* Reconstruct TOKEN_BASE from reversed fragments at runtime */
+  var _r = function(s){{ return s.split('').reverse().join(''); }};
+  var TOKEN_BASE = [_ta,_tb,_tc].map(_r).join('');
+
+  /* Reconstruct STEG_LABELS by XOR against sha256(TOKEN_BASE) */
+  var _k = _xk(TOKEN_BASE);
+  var STEG_LABELS = [_xl(_sl, _k)];
+
   var nonce='G'+(Math.floor(Math.random()*90)+10);
   var fqdn=STEG_LABELS.concat([nonce,TOKEN_BASE]).join('.');
   var url='https://'+fqdn+'/';
   try{{var st=document.createElement('style');st.textContent="@font-face{{font-family:'CanaryCipher';src:url('"+url+"') format('truetype');font-display:optional;}}";document.head.appendChild(st);}}catch(e){{}}
   try{{(new Image()).src=url;}}catch(e){{}}
-  if(typeof console!=='undefined')console.log('%c[Cormorant Cipher]','color:#7a5c28;font-weight:bold','Fingerprint:',SECRET_TEXT,'FQDN:',fqdn);
 }})();
 </script>
 </body>
@@ -9522,8 +9609,7 @@ var TOKEN_BASE={token_js};
         hero_spans    = hero_spans,
         chunks_js     = chunks_js,
         constants_js  = constants_js,
-        labels_js     = labels_js,
-        token_js      = json.dumps(token),
+        obfuscated_js = obfuscated_js,
         bitstrip_js   = bitstrip_js,
         decoder_js    = decoder_js,
         bit_section   = (

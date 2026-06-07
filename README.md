@@ -2,7 +2,7 @@
 
 **Cormorant Cipher** is a document watermarking toolkit that embeds an invisible, machine-readable signature into typeset text. It patches an open-source typeface so that a secret string is physically encoded in the rendered glyphs — imperceptible to a human reader, recoverable by software. When a watermarked document is opened, a DNS canary beacon fires to alert the document owner.
 
-Intended use cases: confidential document tracking, leak detection, AI scraping detection, and honeypot deployments.
+Intended use cases: confidential document tracking, leak detection, AI scraping detection, disrupt offensive AI processing and honeypot deployments.
 
 ---
 

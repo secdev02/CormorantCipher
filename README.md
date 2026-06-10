@@ -82,7 +82,6 @@ The secret is encoded *in the DNS query name itself* — not just as a side-chan
 ```
 encode.py                      Python encoder — generates complete HTML from secret + token
 cormorant-cipher.html          Example output (BOOMTOWN, stealth mode)
-cormorant-cipher-encoder.html  Browser-based encoder tool (no Python required)
 README.md                      This file
 ```
 
